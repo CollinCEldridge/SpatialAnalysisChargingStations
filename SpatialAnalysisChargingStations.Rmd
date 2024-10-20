@@ -1,0 +1,879 @@
+---
+title: "A Spatial Analysis of Electric Vehicle Charging Stations in California"
+author: "Collin Eldridge"
+bibliography: references.bib
+csl: apa.csl
+indent: yes
+output:
+  pdf_document:
+    number_sections: true
+---
+
+```{r, include=FALSE}
+# Only display code when knitting
+knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning=FALSE)
+
+
+# Load relevant libraries
+suppressPackageStartupMessages(library(tidycensus))
+suppressPackageStartupMessages(library(tigris))
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(maditr))
+suppressPackageStartupMessages(library(ggmap))
+suppressPackageStartupMessages(library(spdep))
+suppressPackageStartupMessages(library(readr))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(sp))
+suppressPackageStartupMessages(library(spatialreg))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(gridExtra))
+suppressPackageStartupMessages(library(car))
+suppressPackageStartupMessages(library(sf))
+suppressPackageStartupMessages(library(spatstat))
+suppressPackageStartupMessages(library(methods))
+suppressPackageStartupMessages(library(polyCub))
+suppressPackageStartupMessages(library(ggcorrplot))
+suppressPackageStartupMessages(library(here))
+
+
+# Clear environment
+rm(list = ls())
+
+
+# Load datasets
+load(here("SpatialAnalysisChargingStations.RData"))
+
+
+# Remove 71 duplicates and 5 incorrectly geocoded points from charger data
+chargers <- chargers[-which(duplicated(chargers[, c("Longitude", "Latitude")])),]
+chargers <- chargers %>% filter(chargers$Latitude >= 32.53444 & chargers$Longitude <= -114.13121)
+
+
+# Load county shapefiles
+ca_counties <- counties(state = "CA", year = 2021) %>% as("Spatial")
+
+
+# Combine shapefiles and election results;
+# narrow down data to California 2020, 
+# calculate percentage votes, remove "Other" candidates
+names(results_2020)[4] <- "County"
+names(ca_counties)[5] <- "County"
+ca_counties$County <- toupper(ca_counties$County)
+results_2020 <- results_2020 %>% filter(year == 2020 & state_po == "CA" & candidate != "OTHER") %>% 
+  mutate(perc_votes = candidatevotes/totalvotes) %>% 
+  select(4, 7, 13) %>% # select county, candidate name, and percent of votes for that candidate
+  pivot_wider(names_from = "candidate", values_from = "perc_votes")
+colnames(results_2020)[2] <- "Biden"
+ca_election_map <- merge(ca_counties, results_2020, by = "County")
+election_tidy <- sf::st_as_sf(ca_election_map) # Data ready to be plotted
+
+
+# Census tract data - household income, total population, 
+# Blacks, Hispanics/Latinos
+ca_census <- get_acs(geography = "tract", 
+                     variables = c("B19013_001E", # median household income, adjusted for inflation
+                                   "B01003_001E", # estimated total population 
+                                   "B02001_003", # estimated total black population
+                                   "B03001_003E"), # estimated total Hispanic/Latino population
+                     year = 2021, 
+                     state = "CA", 
+                     geometry = T, 
+                     output = "wide")
+
+
+# Format census data for ease of use
+isAboveZero <- as.vector(sf::st_area(ca_census)) > 0
+ca_census <- ca_census[isAboveZero, ] %>% as("Spatial")
+code_book <- rbind(c("B19013_001E", "median_household_income"), 
+                   c("B01003_001E", "total_pop"), 
+                   c("B02001_003E", "b_alone"), 
+                   c("B03001_003E", "hisp_alone"))
+code_book <- as.data.frame(code_book)
+colnames(code_book) <- c("old_name", "new_name")
+ca_census@data <- setnames(ca_census@data, 
+                           old = code_book$old_name, 
+                           new = code_book$new_name)
+
+
+# Same census data, now at county level instead of tract
+ca_countydata <- get_acs(geography = "county", 
+                     variables = c("B19013_001E", 
+                                   "B01003_001E", 
+                                   "B02001_003E", 
+                                   "B03001_003E"), 
+                     year = 2021, 
+                     state = "CA", 
+                     geometry = T, 
+                     output = "wide")
+
+
+# Format county-level census data
+isAboveZero2 <- as.vector(sf::st_area(ca_countydata)) > 0
+ca_countydata <- ca_countydata[isAboveZero2,] %>% as("Spatial")
+ca_countydata@data <- setnames(ca_countydata@data, 
+                               old = code_book$old_name, 
+                               new = code_book$new_name)
+
+
+# Aggregate charger data to census tracts
+sp::coordinates(chargers) <- ~Longitude+Latitude
+methods::slot(chargers, "proj4string") <- CRS(SRS_string = "EPSG:4269")
+chargers <- spTransform(chargers, sp::proj4string(ca_census))
+overlap_ca <- over(chargers, ca_census)
+ca_ag <- plyr::count(overlap_ca, c('GEOID'))
+ca_ag$GEOID <- as.factor(ca_ag$GEOID)
+colnames(ca_ag) <- c("GEOID", "num_chargers")
+ca_census@data <- left_join(ca_census@data, ca_ag)
+
+
+# Replace NAs in num_chargers with 0's
+ca_census$num_chargers[is.na(ca_census$num_chargers)] <- 0
+
+
+# Calculate percentage of race
+ca_census@data <- ca_census@data %>% mutate(perc_b = b_alone/total_pop,
+                                            perc_hisp = hisp_alone/total_pop)
+
+
+# Aggregate charger data to counties
+overlap_ca2 <- over(chargers, ca_countydata)
+ca_ag2 <- plyr::count(overlap_ca2, c('GEOID'))
+ca_ag2$GEOID <- as.factor(ca_ag2$GEOID)
+colnames(ca_ag2) <- c("GEOID", "num_chargers")
+ca_countydata@data <- left_join(ca_countydata@data, ca_ag2)
+
+
+# Replace NAs in num_chargers with 0's
+ca_countydata$num_chargers[is.na(ca_countydata$num_chargers)] <- 0
+
+
+# Calculate percentage of race
+ca_countydata@data <- ca_countydata@data %>% mutate(
+  perc_b = b_alone/total_pop,
+  perc_hisp = hisp_alone/total_pop,
+  pop_mil = total_pop/1000000)
+
+
+# Format county data so election results are correctly mapped
+ca_countydata <- ca_countydata[order(ca_countydata$NAME), ]
+ca_election_map <- ca_election_map[order(ca_election_map$County), ]
+ca_countydata$election_results <- ca_election_map@data$Biden
+
+
+# Map county-level election results to census tracts
+countynames_censusdata <- regex("(?<=, ).+(?= County)")
+countynames_countydata <- regex(".+(?= County)")
+ca_census@data$countyname <- str_extract(ca_census@data$NAME, countynames_censusdata) # County names from census data
+ca_countydata@data$countyname <- str_extract(ca_countydata@data$NAME, countynames_countydata) # County names from county data
+for (i in 1:length(ca_census@data$GEOID)){ # Add election results to census data
+ ca_census@data$election_results[i] <- 
+   ca_countydata@data$election_results[which(ca_countydata@data$countyname == ca_census@data$countyname[i])] 
+}
+
+
+# Remove islands
+ca_census <- ca_census[-1943, ]
+ca_census <- ca_census[-2043, ]
+ca_census <- ca_census[-5756, ]
+ca_census <- ca_census[-9102, ]
+
+
+# Remove tracts with NA values for income/race
+ca_census <- ca_census[which(!is.na(ca_census$median_household_income)), ]
+
+
+# Correct values of 0 in perc_b
+b_0_index <- which(ca_census$perc_b == 0)
+ca_census$perc_b[b_0_index] <- 0.001
+
+
+# Edit num_chargers to accomodate log transformations
+numcharg_new <- ca_census@data$num_chargers + 1
+ca_census$num_chargers_usable <- numcharg_new
+
+
+# Perform relevant log transformations
+ca_census@data$logtotal_pop <- log(ca_census@data$total_pop)
+ca_census@data$logmedian_household_income <- log(ca_census@data$median_household_income)
+ca_census@data$logperc_b <- log(ca_census@data$perc_b)
+
+
+# ggmap of California
+cali_map <- ggmap(get_stadiamap(c(left = -124.42, bottom = 32.25,
+                                  right = -114.2, top = 42.1)), zoom = 1) + 
+  theme(text = element_text(size=18),
+        axis.title.x=element_blank(), 
+        axis.text.x=element_blank(), 
+        axis.ticks.x=element_blank(),
+        axis.title.y=element_blank(), 
+        axis.text.y=element_blank(), 
+        axis.ticks.y=element_blank())
+
+
+# Create sf object for plotting tract data
+ca_sf <- sf::st_as_sf(ca_census)
+ca_census$id <- row.names(ca_census)
+ca_sf <- left_join(ca_sf, ca_census@data)
+
+
+# Create sf object for plotting county data
+ca_sf2 <- sf::st_as_sf(ca_countydata)
+ca_countydata$id <- row.names(ca_countydata)
+ca_sf2 <- left_join(ca_sf2, ca_countydata@data)
+```
+
+\begin{abstract} 
+\label{sec:abstract}
+
+\hspace{1cm}
+
+Current literature suggests that the locations of battery electric vehicle (BEV) charging stations in the state of California may depend on the distribution of wealth, political ideologies, and race demographics across the state. To better understand this dependency, I perform both an areal and a point process analysis of data comprised of the locations of BEV charging stations in California and the aggregated wealth characteristics, political ideologies, and race demographics of census tracts and counties in the state. For both analyses, I test for complete spatial randomness in the distribution of charging stations. After finding evidence against spatial randomness, I use a spatial Durbin model (for the areal analysis) and a nonhomogeneous Poisson Process (NHPP) model (for the point process analysis) to describe the distribution of charging stations. Both models indicate that wealthier, more populated regions of California with higher proportions of residents identifying as Black and higher proportions of residents identifying as Democrats tend to have more BEV charging stations.
+
+\end{abstract}
+
+------------------------------------------------------------------------
+
+\section{Introduction} \label{sec:introduction}
+
+\hspace{1cm}
+
+Battery electric vehicles (BEVs) are part of a rapidly growing market in the United States for emission-free transportation. Unlike combustion-engine cars (CECs), BEVs cannot refuel at standard gas stations. They instead draw power from the electrical grid at access points known as charging stations --- the BEV equivalents of gas stations. This paper seeks to identify the socioeconomic and political factors that determine where BEV charging stations are located in the state of California, after controlling for population.
+
+\hspace{1cm}
+
+Though BEVs are becoming a more popular form of transportation, they still tend to be more expensive to manufacture than CECs. The increased price of BEVs is an important factor that dissuades many consumers from buying them [@carley2013intent]. As a result, BEVs are not as widely adopted as CECs [@wang2020challenges]. Based on this information, standard supply and demand theory suggests that only the wealthiest consumers will choose to buy their own electric vehicles; these consumers will be able to purchase a BEV, and may wish to own the car as a status symbol or as a means of reducing their carbon footprint. Since these consumers will be the only ones in need of charging stations, it is plausible that wealthier parts of California will have more charging stations than lower-income areas. Consequently, I examine whether the wealth disparities across California affect where charging stations are located in the state.
+
+\hspace{1cm}
+
+Current literature additionally shows that states primarily controlled by the Democratic Party in the US are more likely to invest in energy efficiency than states controlled by the Republican Party [@adua2021politics]. Additionally, improving energy efficiency tends to reduce carbon emissions as less fuel is consumed. These facts, taken together, suggest that reducing carbon emissions is a more important goal for the Democratic Party than it is for the Republican Party. Since the use of BEVs produces fewer carbon emissions relative to CECs, one can also infer that states primarily controlled by the Democratic Party are more likely to invest in the increased use of BEVs. This investment will likely include the construction of more charging stations, as consumers will be more interested in purchasing a BEV if they won't have to worry about finding a place to recharge it. However, very rarely is a state controlled exclusively by one party; there are almost always Republican voters in a Democrat-controlled state, and vice versa. These members of the minority party often do not conform to the majority, but on certain issues (like renewable energy) will express their own views. As a result, it is reasonable to expect regions of a state with lower proportions of Democrats to build fewer charging stations. I therefore explore whether the fluctuations in the proportions of Democrats across California affect where charging stations are located in the state.
+
+\hspace{1cm}
+
+Researchers studying the spatial distribution of charging stations have also uncovered a relationship between race demographics and the locations of charging stations. One study that used socioeconomic data from 2016 found that urban areas of California with majority Black and Latino populations tended to have fewer charging stations compared to other areas [@hsu2021public]. Consequently, I explore whether the proportion of people who identify as Black, Hispanic, or Latino across California affects the locations of charging stations in the state.
+
+\hspace{1cm}
+
+Many other researchers have conducted their own spatial analyses on the locations of BEV charging stations. For instance, multiple studies have sought to optimize the locations of charging stations based on demand and characteristics of the electrical grid, among other factors [@morro2021spatial; @bae2011spatial]. However, no current literature exists answering the question, "After controlling for population, does the frequency of charging stations for BEVs in California depend on median household income, political ideology, or race in the year 2021?" My paper seeks to answer this research question, contributing meaningfully to existing literature studying the spatial distribution of BEV charging stations.
+
+\hspace{1cm}
+
+This paper is organized as follows. In Section \ref{sec:data}, I describe the data I use during both my areal and point process analyses. Information on the steps I take to perform my analyses is in Section \ref{sec:methods}. I present my findings in Section \ref{sec:results}, and discuss both the limitations of my work and areas for future exploration in Section \ref{sec:discussion}.
+
+------------------------------------------------------------------------
+
+\section{Data} \label{sec:data}
+
+\hspace{1cm}
+
+Data used in this analysis were gathered from three different sources: the Alternative Fuels Data Center (AFDC), the American Community Survey (ACS), and the Harvard Dataverse Repository (HDR). This section explores each dataset in turn, as well as transformations made to those datasets.
+
+\subsection{Data Overview} \label{sec:data_overview}
+
+\hspace{1cm}
+
+The AFDC is a repository that contains information on the locations and characteristics of alternative fueling stations in the United States, as well as other alternative fuel data. It is maintained and updated annually by the US Department of Energy's National Renewable Energy Laboratory; each year, newly constructed charging stations are added to the repository while offline stations are removed. The AFDC gets information from trade media, Clean Cities coalitions, infrastructure equipment and fuel providers, original equipment manufacturers, industry groups, and user submissions [@energyAlternativeFuels]. I use a dataset from the AFDC, last updated on April 11th, 2023, that contains the locations of every publicly recognized BEV charging station in California. As one might expect, this dataset is essential to the present analysis of the spatial distribution of BEV charging stations in California. The number of charging stations in each county in California is displayed in Figure 1 below.
+
+\hspace{1cm}
+
+The ACS is an annual federally-conducted survey that draws data from a random sample of the US population. In 2021, the survey gathered data from a total of 198,325 people with homes in California (187,111 living in housing units and 11,214 living in group quarters) [@censusSampleSize]. The ACS publishes its data at a series of geographic scales, one of which is the census tract. For almost every tract, the ACS possesses data on population, race demographics, and median household income (a measure of wealth), among other characteristics. Given that I explore the effects of population, race, and wealth on the spatial frequency of charging stations, I use data on these variables from the 2017-2021 5-year ACS at the census tract level in my analysis. Specifically, I use estimated total population (whose variable ID is "B01003_001E"), estimated total population of citizens identifying as Black or African American alone (whose variable ID is "B02001_003"), estimated total population of citizens identifying as Hispanic or Latino alone (whose variable ID is "B03001_003E"), and median household income in 2021 inflation-adjusted dollars (whose variable ID is "B19013_001E") [@census2021]. I acquired these data using the `get_acs` function in the `tidyverse` R package, which is available from the Comprehensive R Archive Network [@walker2024tidycensus]. The total populations and median household incomes of each county in California are respectively displayed in Figures 2 and 3 below.
+
+\hspace{1cm}
+
+The HDR is a collection of datasets overseen by Harvard University. Individuals and organizations publish their datasets to the HDR, where they become available for use in research. The MIT Election Data and Science Lab maintains a dataset in the HDR on the county-level results of every election from 2000 to 2020 in the United States; these data come from the ballots cast by voters during each election [@DVN/VOQCHQ_2018]. I use the results from the 2020 presidential election in this dataset to quantify the percentage of Democrats in each of the counties in California, under the assumption that the percentage of votes toward the Democratic Party candidate in a given county *is* the percentage of Democrats in that county. Given that Democrats tend to vote for Democratic party candidates and presidential elections tend to have higher voter turnout than other elections, these data are the most accurate representation of the proportion of Democrats per county in California that I can procure.
+
+\subsection{Data Modifications} \label{sec:data_modifications}
+
+\hspace{1cm}
+
+Though the three datasets described above served the needs of this analysis well, they contained some anomalies that needed to be addressed. Within the ACS data, information on median household incomes was missing from 118 tracts. 27 of these tracts were also missing data on the number of people identifying as Black, Hispanic, or Latino in their populations. These missing tracts did not exhibit visual signs of clustering; they also represented a fairly small proportion (about 1.3%) of the 9,109 tracts in California. I removed them without major concern that their removal might skew the results of my analysis. Additionally, one of the tracts was an island off the California coast. There is no consensus among statisticians on how best to deal with neighbor-less spatial entities, meaning it would be extremely difficult to conduct my analysis using this tract [@bivand2013applied]. I decided to remove it as well, again without major concern that its removal would impact the present analysis.
+
+\hspace{1cm}
+
+The AFDC dataset featured some anomalies as well. 72 charging stations were duplicates, 5 possessed latitude and longitude values outside of the California state borders, and 437 came from the removed census tracts. I excluded all 514 of these charging stations from my analysis; much like the removed census tracts, using these stations would have been extremely difficult. They also constituted a relatively small proportion (about 3.6%) of the 14,234 recorded BEV charging stations in California, so I do not expect their removal significantly impacted this analysis.
+
+\hspace{1cm}
+
+In addition to removing impractical entries from the ACS and ADFC datasets, I performed a series of other data transformations. First, I calculated the percentage of Blacks and Hispanics/Latinos in each tract using the raw population counts from the ACS data (I abbreviate the percentage of Hispanics and Latinos to "PHL"). These percentages allowed me to control for population, one of the key criteria established in my research question; the proportions of people identifying as Black in each county are displayed in Figure 4 below. Second, I corrected for skewness in the data by taking the logarithmic transformations of the number of BEV charging stations, total population, proportion of people identifying as Black, and median household income per census tract. This skewness is visible in Figures 1-4 below; for ease of viewing, each figure displays the counties of California, rather than the census tracts (the skewness exists on both levels). Leaving this skewness unchecked likely would have produced misleading results in my analysis; this is expanded upon in Section \ref{sec:methods_areal_analysis}. I abbreviate the log of the total population to "log(TP)" and the log of the median household incomes to "log(MHI)".
+
+```{r}
+# Plot number of charging stations per county
+p1 <- cali_map + geom_sf(data = ca_sf2, aes(fill = num_chargers), 
+                         linewidth = NA, inherit.aes = FALSE) + 
+  scale_fill_distiller(palette = "Spectral", labels = scales::comma) + 
+  labs(title = "Figure 1", subtitle = "Number of Charging\nStations Per County",
+       fill = "Number of\nChargers") +
+  theme(text = element_text(size = 12))
+
+
+# Plot total population per county
+p2 <- cali_map + geom_sf(data = ca_sf2, aes(fill = pop_mil), 
+                         linewidth = NA, inherit.aes = FALSE) + 
+  scale_fill_distiller(palette = "Spectral") + 
+  labs(title = "Figure 2", subtitle = "Total Population \nPer County", 
+       fill = "Population\n(Millions)") + 
+  theme(text = element_text(size = 12))
+
+
+# Plot median household income by county
+p3 <- cali_map + geom_sf(data = ca_sf2, aes(fill = median_household_income), 
+                         linewidth = NA, inherit.aes = FALSE) + 
+  scale_fill_distiller(palette = "Spectral", labels = scales::comma) + 
+  labs(subtitle = "Median Household \nIncome Per County", 
+       title = "Figure 3", fill = "Median\nHousehold\nIncome") + 
+  theme(text = element_text(size = 12))
+
+
+# Plot proportions of blacks per county
+p4 <- cali_map + geom_sf(data = ca_sf2, aes(fill = perc_b), 
+                         linewidth = NA, inherit.aes = FALSE) + 
+  scale_fill_distiller(palette = "Spectral") + 
+  labs(title = "Figure 4", subtitle = "Proportion of Blacks\nPer County", 
+       fill = "Proportion of\nBlacks") + 
+  theme(text = element_text(size = 12))
+```
+
+```{r, fig.height=4, fig.align='center'}
+# Display first and second plots side-by-side
+grid.arrange(p1, p2, nrow = 1, widths = c(1.85, 1.85))
+```
+
+```{r, fig.height=4.25, fig.align='center'}
+# Display third and fourth plots side-by-side
+grid.arrange(p3, p4, nrow = 1, widths = c(2, 2.1))
+```
+
+\hspace{1cm}
+
+My third data transformation was replacing values of "0" with "0.001" for the proportion of people identifying as Black per census tract. This transformation enabled me to compute the logarithmic transformation of the proportions for all census tracts without producing undefined values. Similarly, I increased the count of the charging stations by one for all census tracts. Much like the proportions of people identifying as Black, many of the census tracts contain no charging stations; by adding one station to the count for each tract, I prevented the production of undefined values after taking a logarithmic transformation. Though solving these computational issues did involve directly editing the original data, I believe my changes did not dramatically alter the patterns present in those data. I abbreviate the log of the transformed proportion of Blacks to "log(PB)" and the log of the transformed number of BEV charging stations to "log(CS)".
+
+\hspace{1cm}
+
+Finally, because I conduct this analysis at the census tract level, I was forced to assign the percentage of Democrats recorded in each county to all of the census tracts in that county. I believe the models I describe in Sections \ref{sec:methods} and \ref{sec:results} would have produced more accurate results had I been able to use election data at the census tract level, rather than the county level. Instead, the data I had access to do not show any variation in the percentage of Democrat voters across the census tracts in a given county, which likely does not reflect the true distribution of Democrat voters in California at the census tract level. I abbreviate the percentage of Democrats to "PD".
+
+\hspace{1cm}
+
+After performing these transformations, I examined my final dataset to establish whether any strong correlations existed between my chosen variables; such correlations would indicate that my explanatory variables are not independent of each other, reducing the precision of the estimated parameters in my models. The matrix in Figure 5 below shows that correlation among the variables in my data is fairly weak, with values ranging from -0.54 to 0.26. My data thus prepared, I began constructing models for use in my areal and point process analyses without concern that those models would be negatively impacted by correlations among my covariates.
+
+```{r, fig.height=4, fig.align='center'}
+# Select variables used in modeling
+corr_check <- ca_census@data %>%
+  mutate("log(CS)" = log(num_chargers_usable)) %>% 
+  select("logmedian_household_income", "logtotal_pop", "logperc_b", 
+         "perc_hisp", "election_results", "log(CS)") %>% 
+  rename("log(MHI)" = logmedian_household_income, "log(TP)" = logtotal_pop,
+         "log(PB)" = logperc_b, "PHL" = perc_hisp, "PD" = election_results)
+
+# Create correlation plot
+ggcorrplot(cor(corr_check), type = "upper", lab = TRUE) + 
+  labs(title = "Figure 5", subtitle = "Correlation Matrix") + 
+  theme(text = element_text(size = 12))
+```
+
+------------------------------------------------------------------------
+
+\newpage
+
+\section{Methods} \label{sec:methods}
+
+\hspace{1cm}
+
+I conduct both an areal and a point process analysis of the data described above. I first detail the methods I use to perform my areal analysis, followed by the methods I use to perform my point process analysis.
+
+\subsection{Areal Methods} \label{sec:methods_areal_analysis}
+
+\hspace{1cm}
+
+My areal analysis begins with the construction of a linear regression model that describes the relationship between the location of BEV charging stations (CS) in California and the median household income (MHI), percentage of Democrats (PD), percentage of people identifying as Black (PB), percentage of people identifying as Hispanic or Latino (PHL), and total population (TP) in California. I perform my analysis using areal data at the census tract level. Working with these relatively small areal units enabled me to use more spatially precise measurements of most of my covariates than if I had worked with data at a larger areal unit level. As mentioned above, this increased precision does not apply to my election data, which were gathered at the county level. The linear regression model is shown in Equation \ref{eq:lin_mod}.
+
+```{=tex}
+\begin{equation}
+\label{eq:lin_mod}
+\text{log(CS)} = \beta_0 + \beta_1*\text{log(MHI)} + \beta_2*\text{(PD)} + \beta_3*\text{log(PB)} + \beta_4*\text{PHL} + \beta_5*\text{log(TP)} + \epsilon, \ \epsilon \overset{\mathrm{i.i.d}}{\sim} N(0,\sigma)
+\end{equation}
+```
+\hspace{1cm}
+
+As mentioned previously, the logarithmic transformations of CS, MHI, PB, and TP are to correct for skewness in those variables. The CS and PB variables have also been altered to prevent the regression model from producing undefined values, a fact also mentioned earlier. Correcting for skewness in this model is important because the error terms, $\epsilon$, are assumed to be independent and identically follow a Normal distribution. Had I not corrected for skewness in the data, my model may have violated this assumption and subsequently provided incorrect point estimates and confidence intervals.
+
+\hspace{1cm}
+
+While Equation \ref{eq:lin_mod} explains a potential relationship between the number of charging stations and the median household income, percentage of Democrats, percentage of people identifying as Black, percentage of people identifying as Hispanic or Latino, and total population in each census tract, it does not account for any spatial correlation that might exist across tracts. Two effective methods to test for spatial associations in areal data are the Moran's I and Geary's C tests (these methods equivalently test for the absence of complete spatial randomness, typically abbreviated "CSR"). @bivand2013applied [pp. 276-278] states that, "[Moran's I] is calculated as a ratio of the product of the variable of interest and its spatial lag, with the cross-product of the variable of interest, and adjusted for the spatial weights used..." (the Geary's C test uses a similar formula to perform a similar function). Both tests rely upon a "neighborhood matrix" that captures how areal units are linked to each other. To determine whether to use a spatial regression model, @bivand2013applied [pp. 291-292] recommends conducting a Moran's I test on the residuals of a linear model (like the one in Equation \ref{eq:lin_mod}). Additionally, the authors recommend conducting the test using Monte Carlo simulations, as such simulations "provide protection against errors of inference" [@bivand2013applied, p. 278].
+
+\hspace{1cm}
+
+Heeding this advice, I conduct a total of four Moran's I and Geary's C Monte Carlo simulation tests on the residuals of my linear model to discover whether a spatial regression model will describe the relationship between my chosen covariates and the number of charging stations per tract better than the linear model given in Equation \ref{eq:lin_mod}. I perform two Moran's I tests and two Geary's C tests. For each pair of tests, I use one binary neighborhood matrix and one row-standardized matrix. I use 5,000 Monte Carlo simulations for all tests. In the event all four tests return statistically discernible $p$-values, I will have evidence against a lack of spatial autocorrelation in the residuals of the model given in Equation \ref{eq:lin_mod}. This means I will have evidence to fit a spatial regression model to my data.
+
+\hspace{1cm}
+
+Should I find that a spatial regression model is appropriate for my data, I must then decide which of the spatial regression models is best suited for the data. @bivand2013applied [pp. 293-300] distinguishes between two kinds of spatial regression models: simultaneous autoregressive (SAR) and conditional autoregressive (CAR). Among the SAR models, @bivand2013applied [pp. 304-305] identifies the spatial lag, spatial Durbin, and spatial error models as models commonly used in econometric studies. General forms of these models are given below; putting all four models in the context of my application, $Y$ is the log of the number of charging stations in each census tract (as it is in Equation \ref{eq:lin_mod}), $X$ is a matrix of the five explanatory variables identified in Equation \ref{eq:lin_mod}, $\beta$ is a vector of coefficients for the explanatory variables, and $W$ is a neighborhood matrix.
+
+\hspace{1cm}
+
+The spatial lag model is given in Equation \ref{eq:lag_mod}, while the spatial Durbin model is given in Equation \ref{eq:durb_mod}.
+
+```{=tex}
+\begin{equation}
+\label{eq:lag_mod}
+Y = X \beta + \rho WY  + e, \ e \sim \text{MVN} \ (0, \Sigma)
+\end{equation}
+```
+```{=tex}
+\begin{equation}
+\label{eq:durb_mod}
+Y = X \beta + \rho WY +  \gamma WX + e, \ e \sim \text{MVN} \ (0, \Sigma)
+\end{equation}
+```
+\hspace{1cm}
+
+Both the spatial lag and spatial Durbin models test whether the dependent variable of the model in the neighboring tracts has an effect on the dependent variable in a given tract; in our context, these models represent the log of the number of charging stations in a census tract as a function of both the chosen covariates and the logs of the number of charging stations in the neighboring census tracts, scaled by some value $\rho$. In addition to this, the "$WX$" term in the spatial Durbin model allows it to represent the log of the number of charging stations in a census tract as a function not only of the covariate values in that tract, but also of the covariate values in the neighboring tracts (these neighboring covariate values are scaled by $\gamma$).
+
+\hspace{1cm}
+
+The spatial error model is given in Equation \ref{eq:err_mod}, while the CAR model is given in Equations \ref{eq:car_mod_y} and \ref{eq:car_mod_e}.
+
+```{=tex}
+\begin{equation}
+\label{eq:err_mod}
+Y = X \beta + \lambda W(Y - X \beta) + e, \ e \sim \text{MVN} \ (0, \Sigma)
+\end{equation}
+```
+```{=tex}
+\begin{equation}
+\label{eq:car_mod_y}
+Y_i | Y_{j \sim i} \sim N(X \beta + \lambda W (Y - X \beta),...)
+\end{equation}
+```
+```{=tex}
+\begin{equation}
+\label{eq:car_mod_e}
+e_i | e_{j \sim i} \sim N(\sum_{j \sim i} \frac{c_{ij}e_j}{\sum_{j \sim i} c_{ij}}, \frac{\sigma^2_{e_{i}}}{\sum_{j \sim i} c_{ij}})
+\end{equation}
+```
+\hspace{1cm}
+
+Importantly, in contrast to the spatial lag and spatial Durbin models, both the spatial error and CAR models test the effect of the *residuals* of the neighboring areal units on the response variable of a given areal unit; this is evidenced by the "$Y - X \beta$" terms in both models, which are scaled by $\lambda$. The CAR model also "relies on the conditional distribution of the spatial error terms" while the spatial error model does not [@bivand2013applied, p. 298]. As a result, the CAR model only relies on the spatial error terms from the *immediate* neighbors, giving it a "memorylessness" that the spatial error model lacks.
+
+\hspace{1cm}
+
+In the event my Moran's I and Geary's C tests give me evidence against CSR, I will construct a total of twelve models to fully explore the relationship between the covariates, error terms, and log-transformed number of charging stations per census tract. I will use binary, row-standardized, and 5-nearest neighbor neighborhood matrices, and for each kind of matrix I will fit one each of the spatial lag, spatial Durbin, spatial error, and CAR models. I will then compare the Akaike's Information Criterion (AIC) values of each model. @bivand2013applied [p. 298] encourages the use of AIC values to identify the models that best fit a given dataset, noting that lower AIC values indicate better model fits. This is because AIC values tend to be smaller for models that produce larger maximum values of the associated likelihood function (an indicator of better model fit), but larger for models that contain more variables (thereby penalizing models that include unnecessary and insignificant parameters). Among these twelve models, I should be able to capture the true relationship between the number of charging stations per census tract and my five selected covariates.\newline
+
+\subsection{Point Process Methods} \label{sec:methods_pp_analysis}
+
+\hspace{1cm}
+
+As with my areal analysis, my point process analysis begins with the assumption that the distribution of BEV charging stations across California follows complete spatial randomness (CSR). An appropriate point process model for data that satisfy this assumption is a Homogeneous Poisson Process (HPP), which describes the spatial distribution of a set of points using an intensity function $\lambda(s)$ that is constant across the spatial window (note that $s$ is an arbitrary location within the spatial window) [@bivand2013applied, p. 183]. A general form for a HPP is given in Equation \ref{eq:hpp} below (where the $\lambda$ on the righthand side of the equation is a constant).
+
+```{=tex}
+\begin{equation}
+\label{eq:hpp}
+\text{log} \ \lambda(s) = \lambda
+\end{equation}
+```
+\hspace{1cm}
+
+To establish whether a HPP is appropriate for my data, I test for CSR using the G and F functions (two commonly used tests for CSR in point process analyses) [@bivand2013applied, p. 179-181]. According to @bivand2013applied [p. 179], "the G function measures the distribution of the distances from an arbitrary event to its nearest event". The test for CSR in my charging stations dataset using the G function occurs in two steps. First, a G function is constructed using the original charging stations; this is done by counting the number of charging stations that are at most $r$ units away from the next nearest charging station for many different values of $r$. Second, the charging station locations are randomly scattered across the spatial window (which is California in this context) a certain number of times (I chose 100), and a new G function is constructed each time. This produces an envelope of G functions all constructed using completely spatially random point processes with the same estimated intensity in the window as the original point process. Simulating CSR in this way can be done using the R programming language; @bivand2013applied [p. 180] notes that "point-wise envelopes under CSR can be computed by repeatedly simulating a CSR point process with the same estimated intensity $\hat{\lambda}$ in the study region". A formal test for CSR using the G function involves comparing the calculated G function for the data to the simulated G function envelope. If the calculated G function does not lie within the bounds of the envelope, I will have evidence that the charging station locations are not completely spatially random.
+
+\hspace{1cm}
+
+The F function is calculated in a similar manner to the G function, albeit with some pivotal differences. Instead of measuring the distribution of the distances from a point to the next nearest event, the F function "measures the distribution of all distances from an arbitrary point of the plane to its nearest event" [@bivand2013applied, p. 181]. As with the G function test, a test for CSR using the F function begins by first counting the number of arbitrary points across the spatial window of California that are at most $r$ units away from the nearest charging station. An arbitrarily large number of simulated F functions are then produced by randomly scattering the charging station locations across the spatial window of California (I again chose 100 simulations); these simulations are used in a similar envelope to that from the G function test. With an F function calculated using the original locations and the simulation envelope generated, I can then determine whether or not my data are likely to be completely spatially random based on whether the F function for the original locations lies within the simulation envelope or not.
+
+\hspace{1cm}
+
+In addition to testing for the existence of CSR, both the G and F functions indicate whether there is spatial clustering or inhibition in the distribution of charging stations across California. If the calculated G function is above the simulation envelope, then under the assumption of CSR, an unusually *high* number of charging stations are relatively close to their next nearest charging station. Conversely, if the calculated G function is below the simulation envelope, then under the assumption of CSR, an unusually *low* number of charging stations are relatively close to their next nearest charging station. Based on this information, I can deduce that a calculated G function lying above the simulation envelope indicates spatial clustering, while one that lies below the envelope indicates spatial inhibition. This interpretation is the exact opposite for the F function. If the calculated F function is above the simulation envelope, then an unusually high number of charging stations are relatively close to the arbitrarily chosen points across the spatial window of California; this is a sign of spatial inhibition. Conversely, if the calculated F function is below the simulation envelope, then an unusually low number of charging stations are relatively close to the arbitrarily chosen points across the spatial window of California; this is a sign of spatial clustering.
+
+\hspace{1cm}
+
+In the event that the G and F functions fail to reject the null hypothesis that my charging station data exhibit complete spatial randomness, then a point process model like the HPP in Equation \ref{eq:hpp} is appropriate. However, if the tests show signs of either spatial clustering or inhibition, a more appropriate model is the nonhomogeneous Poisson Process (NHPP). This model differs from the HPP by using spatial variables to describe the non-constant spatial intensities of a point process across its spatial window; this use of spatial covariates is similar to the use of spatial covariates in Equations \ref{eq:lag_mod}-\ref{eq:car_mod_e}. Given the nature of my research question, if I decide to construct a NHPP on the basis of the G and F functions, I will use median household income, percentage of Democrats, percentage of people identifying as Black, percentage of people identifying as Hispanic or Latino, and total population as my covariates. The exact NHPP I will use is given in Equation \ref{eq:nhpp} below.
+
+```{=tex}
+\begin{equation}
+\label{eq:nhpp}
+\text{log} \ \lambda(s) = \beta_0 + \beta_1*\text{log(MHI)} + \beta_2*\text{(PD)} + \beta_3*\text{log(PB)} + \beta_4*\text{PHL} + \beta_5*\text{log(TP)}
+\end{equation}
+```
+
+------------------------------------------------------------------------
+
+\section{Results} \label{sec:results}
+
+\hspace{1cm}
+
+As in Section \ref{sec:methods}, I first describe the results of my areal analysis (where I model charging station counts in California as a function of my income, political ideology, and race variables), followed by the results of my point process analysis (where I model the intensity of charging stations in California as a function of my income, political ideology, and race variables).
+
+\subsection{Areal Analysis} \label{sec:results_areal_analysis}
+
+```{r, include=FALSE, eval=FALSE}
+# Initial linear model
+lin_mod <- lm(log(num_chargers_usable) ~ logmedian_household_income + 
+                election_results + logperc_b + perc_hisp + logtotal_pop, 
+              data=ca_census@data)
+vif(lin_mod)
+
+
+# Create nb object (neighborhood matrix)
+resid <- lin_mod$residuals
+ca_census@data$resid <- resid
+ca_nb <- poly2nb(ca_census)
+
+
+# Moran's I/Geary's C with binary neighborhood matrix
+B_list <- nb2listw(ca_nb, style = "B")
+#calculate using MC permutation testing
+moran.mc(resid, listw = B_list, nsim = 5000)
+geary.mc(resid, listw = B_list, nsim = 5000)
+
+
+# Moran's I/Geary's C with row-standardized neighborhood matrix
+W_list <- nb2listw(ca_nb, style = "W")
+moran.mc(resid, listw = W_list, nsim = 5000)
+geary.mc(resid, listw = W_list, nsim = 5000)
+
+
+# Create 5-nearest neighbors matrix
+ca_census_coords <- coordinates(ca_census)
+knn_obj <- knearneigh(ca_census_coords, 5)
+knn_nb <- knn2nb(knn_obj)
+K_list <- nb2listw(knn_nb)
+
+
+# Spatial autoregressive models
+# Row-standardized error
+ca_error <- errorsarlm(log(num_chargers_usable) ~ log(median_household_income) + 
+                         election_results + log(perc_b) + perc_hisp + log(total_pop), 
+                       data = ca_census@data, listw = W_list)
+summary(ca_error)
+
+
+# Row-standardized car
+ca_car <- spautolm(log(num_chargers_usable) ~ log(median_household_income) + 
+                     election_results + log(perc_b) + perc_hisp + log(total_pop), 
+                   data = ca_census@data, family = "CAR", listw = W_list)
+summary(ca_car)
+
+
+# Row-standardized lag
+ca_lag <- lagsarlm(log(num_chargers_usable) ~ log(median_household_income) + 
+                     election_results + log(perc_b) + perc_hisp + log(total_pop), 
+                   data = ca_census@data, listw = W_list)
+summary(ca_lag)
+
+
+# Row-standardized Durbin
+ca_durbin <- lagsarlm(log(num_chargers_usable) ~ log(median_household_income) + 
+                        election_results + log(perc_b) + perc_hisp + log(total_pop), 
+                      data = ca_census@data, Durbin = T, listw = W_list)
+summary(ca_durbin)
+
+
+# Binary error
+ca_error2 <- errorsarlm(log(num_chargers_usable) ~ log(median_household_income) + 
+                          election_results + log(perc_b) + perc_hisp + log(total_pop), 
+                        data = ca_census@data, listw = B_list)
+summary(ca_error2)
+
+
+# Binary car
+ca_car2 <- spautolm(log(num_chargers_usable) ~ log(median_household_income) + 
+                      election_results + log(perc_b) + perc_hisp + log(total_pop), 
+                    data = ca_census@data, family = "CAR", listw = B_list)
+summary(ca_car2)
+
+
+# Binary lag
+ca_lag2 <- lagsarlm(log(num_chargers_usable) ~ log(median_household_income) + 
+                      election_results + log(perc_b) + perc_hisp + log(total_pop), 
+                    data = ca_census@data, listw = B_list)
+summary(ca_lag2)
+
+
+# Binary Durbin
+ca_durbin2 <- lagsarlm(log(num_chargers_usable) ~ log(median_household_income) + 
+                         election_results + log(perc_b) + perc_hisp + log(total_pop), 
+                       data = ca_census@data, Durbin = T, listw = B_list)
+summary(ca_durbin2)
+
+
+# 5-nearest error
+ca_error3 <- errorsarlm(log(num_chargers_usable) ~ log(median_household_income) + 
+                          election_results + log(perc_b) + perc_hisp + log(total_pop), 
+                        data = ca_census@data, listw = K_list)
+summary(ca_error3)
+
+
+# 5-nearest car
+ca_car3 <- spautolm(log(num_chargers_usable) ~ log(median_household_income) + 
+                      election_results + log(perc_b) + perc_hisp + log(total_pop), 
+                    data = ca_census@data, family = "CAR", listw = K_list)
+summary(ca_car3)
+
+
+# 5-nearest lag
+ca_lag3 <- lagsarlm(log(num_chargers_usable) ~ log(median_household_income) + 
+                      election_results + log(perc_b) + perc_hisp + log(total_pop), 
+                    data = ca_census@data, listw = K_list)
+summary(ca_lag3)
+
+
+# 5-nearest Durbin
+ca_durbin3 <- lagsarlm(log(num_chargers_usable) ~ log(median_household_income) + 
+                         election_results + log(perc_b) + perc_hisp + log(total_pop), 
+                       data = ca_census@data, Durbin = T, listw = K_list)
+summary(ca_durbin3)
+```
+
+\hspace{1cm}
+
+As stated in Section \ref{sec:methods_areal_analysis}, I begin my areal analysis of the distribution of charging stations in California by running two Moran's I and two Geary's C tests on the residuals from the linear model in Equation \ref{eq:lin_mod}. The coefficient estimates and $p$-values of all four tests are displayed in Table 1 below. All $p$-values in the table are less than 0.001, meaning there is statistically discernible evidence to reject the null hypothesis that there is no spatial structuring in the residuals of the linear model from Equation \ref{eq:lin_mod}. In particular, all the coefficient estimates suggest that there is spatial clustering in the residuals of that model. Clustering is shown in the Moran's I test by positive coefficients, while for the Geary's C test it is shown by coefficients less than 1. Based on the results of these four tests, I turn to a spatial autoregressive model to better describe the relationship between the number of charging stations in a given tract and the characteristics of that tract and its neighbors.
+
++---------------------+----------------------+----------------------+
+| Neighborhood Matrix | Moran's I            | Geary's C            |
++=====================+======================+======================+
+| Row-standardized    | Coefficient: 0.18369 | Coefficient: 0.87835 |
+|                     |                      |                      |
+|                     | $p$-value: \<0.0002  | $p$-value: \<0.0002  |
++---------------------+----------------------+----------------------+
+| Binary              | Coefficient: 0.19996 | Coefficient: 0.91456 |
+|                     |                      |                      |
+|                     | $p$-value: \<0.0002  | $p$-value: \<0.0002  |
++---------------------+----------------------+----------------------+
+
+: Moran's I and Geary's C Results
+
+\hspace{1cm}
+
+After establishing the existence of spatial structuring in the residuals of the linear model from Equation \ref{eq:lin_mod}, I construct the twelve spatial regression models described in Section \ref{sec:methods_areal_analysis} and record the AIC values for each. Table 2 displays these AIC values. Importantly, the spatial Durbin model tends to have slightly lower AIC values compared to the other model types for all three matrix formats; the only exception is the row-standardized matrix, for which the CAR model produces a slightly lower AIC value than the Durbin model. This suggests that the number of charging stations and the covariate values of the neighboring tracts likely have an effect on the number of charging stations in a given tract. Additionally, across all three matrix types, the Binary matrix tends to have the lowest AIC values for all models. This suggests that the *sum* of the "values" (either error terms, outcome values, or covariate values depending on the model) of the neighboring tracts are better at explaining the number of charging stations per census tract than the *average* of the "values" from *all* the neighboring tracts (which is captured by the row-standardized matrix), or the average of the "values" from the *5-nearest* neighboring tracts (which is captured by the 5-nearest neighbors matrix). Based on this table, I use the spatial Durbin model with a Binary matrix to describe the relationship between my covariates and outcome, as this model has the lowest AIC of the twelve models considered.
+
++---------------------+-------------+-------------+-------------------+----------------------+
+| Neighborhood Matrix | Error Model | CAR Model   | Spatial Lag Model | Spatial Durbin Model |
++=====================+=============+=============+===================+======================+
+| Row-Standardized    | AIC: 19,307 | AIC: 19,183 | AIC: 19,317       | AIC: 19,277          |
++---------------------+-------------+-------------+-------------------+----------------------+
+| Binary              | AIC: 19,118 | AIC: 19,019 | AIC: 18,941       | AIC: 18,837          |
++---------------------+-------------+-------------+-------------------+----------------------+
+| 5-Nearest Neighbors | AIC: 19,528 | AIC: 19,488 | AIC: 19,539       | AIC: 19,479          |
++---------------------+-------------+-------------+-------------------+----------------------+
+
+: Autoregressive Model Results
+
+\hspace{1cm}
+
+The coefficient estimates from the regression output of the spatial Durbin model with a Binary matrix are shown in Table 3. Each of the six "Lagged" variables describes the effect of the sum of the neighboring covariate values on the log of the number of charging stations in a given tract. The final parameter in the model, $\rho$, describes the effect of the sum of the log of the number of charging stations in the neighboring census tracts on the log of the number of charging stations in a given tract; recall the use of this parameter in the Durbin model provided in Equation \ref{eq:durb_mod}. When interpreting the coefficients for each parameter in the model, it is important to recall that I have used logarithmic transformations on the number of charging stations, median household income, percent of people identifying as Black, and total population variables.
+
++-----------------------------------------------+----------------------+---------------+
+| Variable Name                                 | Coefficient Estimate | $P$-value     |
++===============================================+======================+===============+
+| Intercept                                     | 2.479                | 4.396e-14     |
++-----------------------------------------------+----------------------+---------------+
+| log(Median Household Income)                  | -0.234               | \<2.2e-16     |
++-----------------------------------------------+----------------------+---------------+
+| Percent of Democrats                          | -0.177               | 0.353         |
++-----------------------------------------------+----------------------+---------------+
+| log(Percent Black)                            | 0.014                | 0.013         |
++-----------------------------------------------+----------------------+---------------+
+| Percent Hispanic or Latino                    | -0.340               | 5.891e-09     |
++-----------------------------------------------+----------------------+---------------+
+| log(Total Population)                         | 0.064                | 5.476e-04     |
++-----------------------------------------------+----------------------+---------------+
+| Lagged Intercept                              | -0.228               | 7.430e-04     |
++-----------------------------------------------+----------------------+---------------+
+| Lagged log(Median Household Income)           | 0.025                | 2.986e-05     |
++-----------------------------------------------+----------------------+---------------+
+| Lagged Percent of Democrats                   | 0.078                | 0.010         |
++-----------------------------------------------+----------------------+---------------+
+| Lagged log(Percent Black)                     | -0.004               | 0.002         |
++-----------------------------------------------+----------------------+---------------+
+| Lagged Percent Hispanic or Latino             | -0.002               | 0.860         |
++-----------------------------------------------+----------------------+---------------+
+| Lagged log(Total Population)                  | -0.011               | 0.048         |
++-----------------------------------------------+----------------------+---------------+
+| $\rho$                                        | 0.066                | \< 2.22e-16   |
++-----------------------------------------------+----------------------+---------------+
+
+: Spatial Durbin Model with Binary Matrix
+
+\hspace{1cm}
+
+11 of the 13 coefficients in this regression model possess statistically discernible $p$-values at a 5% significance level. This means that, for instance, there is statistically discernible evidence that a 1-percentage point increase in the proportion of residents identifying as Hispanic or Latino in a given tract is predicted to decrease the number of charging stations in that tract by about 28.8 percent, holding all other variables constant. There is also statistically discernible evidence that doubling the sum of the median household incomes of the neighbors of a given tract is predicted to increase the number of charging stations in that tract by about 1.7 percent, holding all other variables constant. I leave specifically interpreting the remaining coefficients as an exercise to the reader; however, in general I can conclude based on this model that, holding all other variables constant:
+
+1.  tracts with larger median household incomes tend to have fewer charging stations;
+
+2.  tracts with higher proportions of people identifying as Black tend to have more charging stations;
+
+3.  tracts with higher proportions of people identifying as Hispanic or Latino tend to have fewer charging stations;
+
+4.  tracts with higher populations tend to have more charging stations;
+
+5.  tracts with neighbors that have larger median household incomes tend to have more charging stations;
+
+6.  tracts with neighbors that have more Democrats tend to have more charging stations;
+
+7.  tracts with neighbors that have higher proportions of people identifying as Black tend to have fewer charging stations;
+
+8.  tracts with neighbors that have larger populations tend to have more charging stations;
+
+9.  tracts with neighbors that have more charging stations tend to have more charging stations.
+
+\hspace{1cm}
+
+Overall, the coefficients on the percent of residents identifying as Hispanic or Latino, the log of the total population, the lagged log of median household income, the lagged percent of Democrats, the lagged percent of residents identifying as Black, and the lagged log of the total population all agree with the current literature. These coefficients suggest that wealthier, more populated regions of California with more Democrats and lower percentages of residents identifying as Black, Hispanic or Latino tend to have more BEV charging stations. In addition, we can see that areas of California surrounded by many charging stations will themselves tend to have many charging stations. This is not a surprising result in light of the spatial clustering I found in the locations of charging stations in California; I expand upon this observation in Section \ref{sec:results_pp_analysis}.
+
+\hspace{1cm}
+
+However, the Durbin model does not exactly agree with the literature. In particular, the model states that tracts with larger median household incomes tend to have fewer charging stations, while tracts with higher proportions of people identifying as Black tend to have more charging stations. Additionally, I lack statistically discernible evidence based on this model to conclude that the number of Democrats in a given tract has an effect on the number of charging stations in that tract, or that the proportion of people identifying as Hispanic or Latino in the neighbors of a given tract has an effect on the number of charging stations in that tract. These results are somewhat surprising, as based on the literature I would expect that (1) tracts with larger median household incomes have more charging stations, (2) tracts with higher proportions of people identifying as Black have fewer charging stations, and (3) the number of Democrats in a given tract and the proportion of people identifying as Hispanic or Latino in the neighbors of that tract both have an effect on the number of charging stations in the tract [@carley2013intent; @adua2021politics; @hsu2021public].
+
+\hspace{1cm}
+
+Additionally, all of the coefficients in the Durbin model (apart from the intercept and percent of residents identifying as Hispanic or Latino) have opposite signs between their lagged and unlagged variables, though it is worth recalling the statistical insignificance of the coefficient on the lagged percent of residents identifying as Hispanic or Latino (meaning that that coefficient is statistically indistinguishable from 0). These conflicting signs make it difficult to identify the true relationship between the parameters in the model and the number of charging stations per census tract.
+
+\hspace{1cm}
+
+The statistical insignificance on the coefficient of the lagged percent Democrat variable may be the result of my decision to assign the percentage of Democrats recorded in a given county to all of the census tracts in that county. As a result, my model likely does not capture the true effect of political preferences on the location of BEV charging stations. Furthermore, the discrepancies in my selected Durbin model may be caused by misleading results from my Moran's I and Geary's C tests. @bivand2013applied [p. 289] notes that "...the spatial autocorrelation that we seem to have found may actually come from model misspecification". It is possible that other race variables have an effect on charging station location, though current literature only hints at such an association. It is also possible that the degree to which a census tract supports the Democrat Party really has no effect on the number of charging stations in that tract, or that the 119 tracts I removed to conduct my analysis may have had a significant impact on the coefficient estimates in Equation \ref{eq:lin_mod} or my Durbin model. Should any of these facts be true, my initial linear model would incorrectly describe the relationship between the locations of charging stations and my selected variables. Consequently, it is possible that I identified spatial structuring in the residuals of the wrong model, meaning I may have had no reason to fit a SAR or CAR model to the data in the first place. \newline
+
+\subsection{Point Process Analysis} \label{sec:results_pp_analysis}
+
+\hspace{1cm}
+
+As stated in Section \ref{sec:methods_pp_analysis}, I begin my point process analysis of the distribution of charging stations in California by constructing a G and an F function for my data. I use 100 simulations to construct the envelope for my test, and visually determined whether the calculated G and F functions fell within their respective envelopes. Both the G and F functions are displayed in the plots below, with the grey shaded region representing the simulation envelope (this region is extremely thin, and surrounds the red lines in both plots). The viewer may note that the calculated G function lies above its envelope, while the calculated F function lies below its envelope. As mentioned in Section \ref{sec:methods_pp_analysis}, this indicates spatial clustering in the distribution of charging stations in California; I hinted at this clustering in Section \ref{sec:results_areal_analysis}.
+
+```{r}
+# Function to format data
+# Adapted from the deprecated maptools package
+as.im.SpatialGridDataFrame = function(from) {
+    xi <- as.image.SpatialGridDataFrame(from)
+    spatstat.geom::im(t(xi$z), xcol=xi$x, yrow=xi$y)
+}
+
+
+# Create PPP object
+ca_census <- spTransform(ca_census, CRS(SRS_string = "EPSG:3310"))
+poly_win <- polyCub::as.owin.SpatialPolygons(ca_census)
+chargers <- spTransform(chargers, proj4string(ca_census))
+ppp_charg <- as.ppp(coordinates(chargers), W = poly_win)
+```
+
+\newpage
+
+```{r, fig.width=3.5, fig.height=3.5, fig.align='center', results='hide'}
+# Construct and plot G function
+g_env_charg <- envelope(ppp_charg, fun = Gest, nrank = 2, nsim = 100)
+plot(g_env_charg, main = "G function", xlim = c(0, max(g_env_charg$r)))
+
+
+# Construct and plot F function
+f_env_charg <- envelope(ppp_charg, fun = Fest, nrank = 2, nsim = 100)
+plot(f_env_charg, main = "F function", xlim = c(0, max(f_env_charg$r)))
+```
+
+```{r}
+# Fit NHPP
+# 200x200 grid
+lattice <- expand.grid(Long = seq(ca_census@bbox[1,1],
+                                  ca_census@bbox[1,2], length.out = 200), 
+                       Lat = seq(ca_census@bbox[2,1],
+                                 ca_census@bbox[2,2], length.out = 200))
+
+# Remove lattice points not in California
+sp_lattice <- lattice
+sp::coordinates(sp_lattice) <- ~Long+Lat
+methods::slot(sp_lattice, "proj4string") <- methods::slot(ca_census, "proj4string")
+overlap_set <- over(sp_lattice, ca_census)
+lattice <- lattice[!(is.na(overlap_set$GEOID)),]
+
+# Combine with the rest of the Census data
+lattice <- cbind(lattice, overlap_set[-which(is.na(overlap_set$GEOID)), ])
+
+# Remove grid points with NA for total_pop, med_income
+lattice <- lattice %>% filter(!is.na(logtotal_pop),
+                              !is.na(logmedian_household_income),
+                              !is.na(logperc_b),
+                              !is.na(perc_hisp),
+                              !is.na(election_results))
+
+# Assign projection to lattice
+sp::coordinates(lattice) <- ~Long+Lat
+methods::slot(lattice, "proj4string") <- methods::slot(ca_census, "proj4string")
+
+# Change from SpatialPointsDataFrame to SpatialGridDataFrame
+gridded(lattice) = TRUE
+lattice_grid <- as(lattice, "SpatialGridDataFrame")
+
+# Convert variables to IM objects
+logtotalpop_im <- as.im.SpatialGridDataFrame(lattice_grid["logtotal_pop"])
+logmedianhouseholdincome_im <- as.im.SpatialGridDataFrame(lattice_grid["logmedian_household_income"])
+logpercb_im <- as.im.SpatialGridDataFrame(lattice_grid["logperc_b"])
+perchisp_im <- as.im.SpatialGridDataFrame(lattice_grid["perc_hisp"])
+electionresults_im <- as.im.SpatialGridDataFrame(lattice_grid["election_results"])
+
+
+# Fitted model
+fit_charg <- ppm(Q = ppp_charg, trend = ~logtotalpop_im + logmedianhouseholdincome_im + 
+                   logpercb_im + perchisp_im + electionresults_im,
+                 covariates = list(logtotal_pop = logtotalpop_im,
+                                   logmedian_household_income = logmedianhouseholdincome_im,
+                                   logperc_b = logpercb_im,
+                                   perc_hisp = perchisp_im,
+                                   election_results = electionresults_im))
+#summary(fit_charg)
+```
+
+\hspace{1cm}
+
+Following the establishment of spatial clustering in the data, I use the NHPP given in Equation \ref{eq:nhpp} to model the changes in the spatial intensity of charging stations across California. Details for this NHPP are displayed in Table 4.
+
++----------------------------------------+----------------------+-------------------------------------+-------------------------------------+
+|                                        | Coefficient Estimate | 95% Confidence Interval Lower Bound | 95% Confidence Interval Upper Bound |
++========================================+======================+=====================================+=====================================+
+| Intercept                              | -38.037              | -38.549                             | -37.525                             |
++----------------------------------------+----------------------+-------------------------------------+-------------------------------------+
+| log(Total Population)                  | 0.430                | 0.400                               | 0.460                               |
++----------------------------------------+----------------------+-------------------------------------+-------------------------------------+
+| log(Median Household Income)           | 1.250                | 1.202                               | 1.297                               |
++----------------------------------------+----------------------+-------------------------------------+-------------------------------------+
+| log(Percent Black)                     | 0.340                | 0.329                               | 0.352                               |
++----------------------------------------+----------------------+-------------------------------------+-------------------------------------+
+| Percent Hispanic or Latino             | 0.817                | 0.723                               | 0.911                               |
++----------------------------------------+----------------------+-------------------------------------+-------------------------------------+
+| Percent Democrat                       | 7.917                | 7.725                               | 8.109                               |
++----------------------------------------+----------------------+-------------------------------------+-------------------------------------+
+
+: NHPP Output
+
+\hspace{1cm}
+
+Importantly, all of the coefficients in this model are statistically discernible at a 5% level of significance; this is evidenced by the fact that none of the 95% confidence intervals contain 0 between their lower and upper bounds. We can therefore deduce that:
+
+1.  the total population at the census tract level has a positive effect on the spatial intensity of BEV charging stations in California;
+
+2.  the median household income at the census tract level has a positive effect on the spatial intensity of BEV charging stations in California;
+
+3.  the percent of residents who identify as Black at the census tract level has a positive effect on the spatial intensity of BEV charging stations in California;
+
+4.  the percent of residents who identify as Hispanic or Latino at the census tract level has a positive effect on the spatial intensity of BEV charging stations in California;
+
+5.  the percent of Democrats at the census tract level has a positive effect on the spatial intensity of BEV charging stations in California.
+
+\hspace{1cm}
+
+These coefficients mean that, as each of these variables increases in a tract in California, we would expect to see more charging stations in that tract.
+
+\hspace{1cm}
+
+Note that as in Section \ref{sec:results_areal_analysis}, some of these estimates agree with current literature while others don't. In particular, the literature agrees with the NHPP results in Table 4 that an increase in the total population, median household income, and percent of Democrats in a given tract is associated with an increase in the number of BEV charging stations in that tract. However, the literature disagrees with my NHPP that an increase in the percent of residents who identify as Black, Hispanic, or Latino in a tract is associated with an increase in the number of BEV charging stations in that tract. Much like Section \ref{sec:results_areal_analysis}, these discrepancies may be the result of (1) insufficient data on the percentage of Democrats per tract, (2) model misspecification, or (3) the missing tracts.
+
+------------------------------------------------------------------------
+
+\section{Discussion} \label{sec:discussion}
+
+\hspace{1cm}
+
+Altogether, my areal and point process analyses show that the spatial frequency of charging stations for BEVs in California does depend on median household income, political ideology, and race in the year 2021, after controlling for population. Both the Durbin and NHPP models I fit to the data indicate to some degree that wealthier, more populated regions of California with higher proportions of both residents identifying as Black and Democrats tend to have more BEV charging stations. However, the Durbin model's lagged estimates unanimously disagree with these conclusions, hinting at a repulsion effect between neighboring tracts. This repulsion effect should be explored in future research to more definitively answer my research question.
+
+\hspace{1cm}
+
+Future research should replace the county-level election data I used with tract-level data, if possible. Measuring all variables at the census-block level will also likely improve the precision of both the areal and point process analyses, as census blocks are smaller than census tracts and are therefore more spatially precise. If possible, such an analysis should also use all of the census blocks in California, rather than removing blocks with missing values as I did of the tracts in my analysis. Future research should also replace the NHPP model I fit in this report with a Log Gaussian Cox Process (LGCP) model, a more computationally complex point process model relative to a NHPP. While the NHPP is completely restricted to the variables it contains, an LGCP includes a smoothly varying Gaussian process term, denoted $\omega(s)$; this term allows the LGCP to capture variability in the spatial intensity of the data not directly explained by the variables in the model, making it an overall better model in point process analyses compared to a NHPP. Unfortunately, the computational limits I faced during my analysis required that I use a NHPP instead of a LGCP, though future researchers with more resources should consider modeling charging station intensities using a LGCP.
+
+\newpage
+
+------------------------------------------------------------------------
+
+\section{References} \label{sec:references}
